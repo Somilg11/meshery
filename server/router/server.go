@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"time"
 
 	"github.com/gorilla/mux"
 	"github.com/meshery/meshery/server/models"
@@ -24,6 +23,22 @@ type Router struct {
 func registerRegistryRoute(gMux *mux.Router, subpath string, handler http.Handler, methods ...string) {
 	gMux.Handle("/api/registry"+subpath, handler).Methods(methods...)
 	gMux.Handle("/api/meshmodels"+subpath, handler).Methods(methods...) // Deprecated: /api/meshmodels alias
+}
+
+// providerAcceptsToken reports whether provider accepts token as a valid
+// session, without installing it in the client's browser first.
+//
+// Provider.GetSession reads the token off the request rather than taking it as
+// an argument, so the candidate is offered on a shallow copy whose Cookie
+// header carries only that token. Stripping the inbound cookies matters: with
+// the caller's own token still present, GetSession would validate that one and
+// report success for a candidate it never inspected.
+func providerAcceptsToken(provider models.Provider, r *http.Request, token string) bool {
+	probe := r.Clone(r.Context())
+	probe.Header = r.Header.Clone()
+	probe.Header.Del("Cookie")
+	probe.AddCookie(&http.Cookie{Name: models.TokenCookieName, Value: token})
+	return provider.GetSession(probe) == nil
 }
 
 // NewRouter returns a new ServeMux with app routes.
@@ -528,17 +543,39 @@ func NewRouter(_ context.Context, h models.HandlerInterface, port int, g http.Ha
 	gMux.Handle("/api/integrations/connections/{connectionId}/controllers/config", h.ProviderMiddleware(h.AuthMiddleware(h.SessionInjectorMiddleware(h.UpdateConnectionControllersConfig), models.ProviderAuth))).
 		Methods("PUT")
 
-	gMux.HandleFunc("/auth/redirect", func(w http.ResponseWriter, r *http.Request) {
+	// /auth/redirect installs a provider-issued token as this browser's Meshery
+	// session cookie. The token arrives in the query string of an unauthenticated
+	// GET, so it is caller-supplied input and carries no authority of its own:
+	// the provider has to vouch for it before it becomes a session.
+	//
+	// ProviderMiddleware supplies the provider on the request context, which is
+	// the only supported way to resolve one on the request path.
+	gMux.Handle("/auth/redirect", h.ProviderMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		provider, ok := r.Context().Value(models.ProviderCtxKey).(models.Provider)
+		if !ok || provider == nil {
+			http.Redirect(w, r, "/provider", http.StatusFound)
+			return
+		}
+
+		// The local provider is single-user and unauthenticated: its GetSession
+		// accepts every request, so validating here would be a no-op that still
+		// wrote an unvouched-for cookie value. It has no session to install.
+		if provider.GetProviderType() != models.RemoteProviderType {
+			h.ServeUI(w, r, "/provider", "../../provider-ui/out/")
+			return
+		}
+
 		token := r.URL.Query().Get("token")
-		http.SetCookie(w, &http.Cookie{
-			Name:     models.TokenCookieName,
-			Value:    token,
-			Path:     "/",
-			HttpOnly: true,
-			Expires:  time.Now().Add(24 * time.Hour),
-		})
+		if token == "" || !providerAcceptsToken(provider, r, token) {
+			http.Redirect(w, r, "/provider", http.StatusFound)
+			return
+		}
+
+		// SetJWTCookie owns the cookie's flags and lifetime, so the attributes
+		// stay in one place instead of drifting from the rest of the auth flow.
+		provider.SetJWTCookie(w, token)
 		h.ServeUI(w, r, "/provider", "../../provider-ui/out/")
-	}).
+	}))).
 		Methods("GET")
 
 	// Kubernetes Health Probes
